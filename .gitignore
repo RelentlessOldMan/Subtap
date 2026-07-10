@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Subtap writes these next to your song files (never inside the repo), listed just in case
+*.srt.bak
+*.srt.bak.*
