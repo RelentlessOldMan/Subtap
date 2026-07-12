@@ -329,6 +329,7 @@ PAGE = r"""<!doctype html>
       <button id="loadaudio" title="open an audio file (wav / mp3 / m4a / ogg / flac)">Load Audio</button>
       <button id="load" title="open a caption file (.srt, or a plain-lyrics .txt to tap from scratch)">Load Captions</button>
       <button class="primary" id="save" disabled>Save SRT</button>
+      <button id="savetxt" title="download the caption text as plain lyrics (one line per cue, no timings)" disabled>Save TXT</button>
       <button id="revert">Revert</button>
     </div>
     <input type="file" id="audiofile" accept="audio/*,.wav,.mp3,.m4a,.ogg,.flac,.opus" style="display:none">
@@ -471,7 +472,9 @@ function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;")
 function applyCues(arr, opts){
   opts = opts || {};
   CUES = (arr||[]).map(c => { const s=+c.start||0, e=+c.end||0;
-    return {start:s, end:e, text:(c.text!=null?c.text:""), o0:s, oe:e}; });
+    const o={start:s, end:e, text:(c.text!=null?c.text:""), o0:s, oe:e};
+    if(c.blanksAfter) o.blanksAfter = c.blanksAfter|0;   // remembered blank lines (stanza breaks)
+    return o; });
   ORIG = JSON.parse(JSON.stringify(CUES));
   dirty = !!opts.dirty; justSaved = !!opts.justSaved;
   const keep = (sel>=0 && sel<CUES.length) ? sel : 0;
@@ -749,6 +752,7 @@ let dirty=false, justSaved=false;
 function refreshSave(){
   const hasAudio = !!player.buf, hasCues = CUES.length>0, hasSel = sel>=0 && sel<CUES.length;
   const b=$("#save"); b.disabled=!dirty; b.textContent=(!dirty&&justSaved)?"Saved!":"Save SRT";
+  $("#savetxt").disabled = !hasCues;
   $("#revert").disabled = !dirty;
   $("#play").disabled = !hasAudio;
   $("#tapboth").disabled = !(hasAudio && hasCues);
@@ -914,6 +918,14 @@ async function saveServer(){
   else flash("save failed: "+(j.error||"?"));
 }
 $("#save").addEventListener("click",save);
+// Save TXT: always a download (no write-back / backups) — the caption text as plain lyrics.
+function saveTXT(){
+  if(!CUES.length){ flash("Load a caption file first."); return; }
+  const base = (capName||"captions").replace(/\.[^.]+$/,"").replace(/\.plain$/i,"");
+  const name = base+".plain.txt";
+  _download(name, buildTXT(CUES)); flash("downloaded "+name);
+}
+$("#savetxt").addEventListener("click",saveTXT);
 $("#revert").addEventListener("click",()=>{ CUES=JSON.parse(JSON.stringify(ORIG)); dirty=false; justSaved=false; refreshSave();
   render(); selectCue(Math.min(sel,CUES.length-1)); drawWave(); });
 
@@ -921,6 +933,10 @@ $("#revert").addEventListener("click",()=>{ CUES=JSON.parse(JSON.stringify(ORIG)
 // saveMode: "server" (a song was launched -> save in place) | "handle" (File System Access, write
 // back to the opened file) | "download" (fallback: download the .srt). null until something loads.
 let saveMode=null, capHandle=null, capName="", audioName="", capsPlaceholder=false;
+// blank lines from a loaded .txt are dropped from the UI (no empty cues) but remembered so a
+// re-save reproduces them: lyricLead = blank lines before the first line, and each cue carries
+// a .blanksAfter count. .srt has no place for them, so it just ignores them (stays clean).
+let lyricLead=0;
 
 // ---- SRT / plain-lyrics parsing ----
 function _tsToSec(t){ const m=t.match(/(\d+):(\d{2}):(\d{2})[,.](\d{3})/);
@@ -937,17 +953,31 @@ function parseSRT(text){
   }
   return cues;
 }
+// Split plain lyrics into one entry per non-blank line, remembering blank lines: leading blanks
+// (before the first line) and, on each entry, blanksAfter = blank lines that followed it. This is
+// what lets Save reproduce stanza breaks that the UI itself doesn't show as cues.
+function parseLyrics(text){
+  const rows=[]; let pending=0, lead=0;
+  for(const line of text.replace(/\r/g,"").split("\n")){
+    if(line.trim()===""){ rows.length ? pending++ : lead++; continue; }
+    if(rows.length) rows[rows.length-1].blanksAfter = pending;
+    pending=0; rows.push({text:line.trim(), blanksAfter:0});
+  }
+  return {rows, lead};   // trailing blanks after the last line are dropped
+}
 function parseCaptions(text){
+  lyricLead=0;                                           // reset; only a .txt sets it
   const srt = parseSRT(text);
   if(srt.length){ capsPlaceholder=false; return srt; }   // real timestamps -> leave them alone
-  // no timestamps -> plain lyrics (.txt): one cue per line.
-  const lines = text.replace(/\r/g,"").split("\n").map(l=>l.trim()).filter(Boolean);
+  // no timestamps -> plain lyrics (.txt): one cue per non-blank line, blank lines remembered.
+  const {rows, lead} = parseLyrics(text); lyricLead=lead;
+  const mk = (start,end,r)=>({start, end, text:r.text, blanksAfter:r.blanksAfter});
   if(dur>0){                                              // audio known -> spread across the song
-    capsPlaceholder=false; const seg=dur/Math.max(lines.length,1);
-    return lines.map((t,i)=>({start:i*seg, end:(i+1)*seg, text:t}));
+    capsPlaceholder=false; const seg=dur/Math.max(rows.length,1);
+    return rows.map((r,i)=>mk(i*seg, (i+1)*seg, r));
   }
   capsPlaceholder=true;                                   // no audio yet -> 2s default, re-spread later
-  return lines.map((t,i)=>({start:i*2, end:i*2+2, text:t}));
+  return rows.map((r,i)=>mk(i*2, i*2+2, r));
 }
 // ---- SRT building (for handle write-back / download) ----
 function _pad(n,w){ n=String(n); while(n.length<w) n="0"+n; return n; }
@@ -957,6 +987,20 @@ function _secToTs(s){ if(s<0||isNaN(s))s=0; const ms=Math.round(s*1000);
 function buildSRT(cues){
   return [...cues].sort((a,b)=>a.start-b.start)
     .map((c,i)=>(i+1)+"\n"+_secToTs(c.start)+" --> "+_secToTs(c.end)+"\n"+(c.text||"")).join("\n\n")+"\n";
+}
+// plain lyrics: the cue text from the .srt, sorted by time, verbatim (internal line breaks /
+// whitespace preserved). One cue per line, with any remembered blank lines (leading + each cue's
+// .blanksAfter) re-inserted so a loaded-then-saved .txt keeps its original stanza breaks.
+// Text-less cues (a just-added line, or one whose text was cleared) contribute nothing to a
+// lyrics file -- skip them, so they don't emit stray blank lines that masquerade as stanza breaks.
+function buildTXT(cues){
+  const sorted=[...cues].sort((a,b)=>a.start-b.start).filter(c=>(c.text||"").trim()!==""), out=[];
+  for(let i=0;i<lyricLead;i++) out.push("");
+  sorted.forEach((c,i)=>{
+    out.push(c.text);
+    if(i<sorted.length-1) for(let k=0;k<(c.blanksAfter|0);k++) out.push("");
+  });
+  return out.join("\n")+"\n";
 }
 function _download(name, text){
   const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([text],{type:"text/plain"}));
