@@ -138,6 +138,58 @@ def parse_srt(text: str):
     return cues
 
 
+# A section header in a lyric file, e.g. "**[Verse 1]**" or "[Chorus]" -- a stanza boundary,
+# not a sung line.
+_HEADER_RE = re.compile(r"^\s*(?:\*\*)?\[[^\]]*\](?:\*\*)?\s*$")
+
+
+def parse_stanza(text: str):
+    """Parse a lyric file into (sung lines, blank-line structure) for overlaying stanza breaks.
+
+    Returns {"lines": [...], "break_after": [n, ...], "lead": n}: the non-blank sung lines in
+    order, how many blank lines follow each (a stanza break is >= 1), and blank lines before the
+    first line. Section headers are dropped but count as a break after the previous line, so an
+    .orig.txt (headed sections) and a .plain.txt (bare, blank-separated) yield the same breaks.
+    """
+    lines, break_after, lead, pending = [], [], 0, 0
+    for ln in text.replace("\r", "").split("\n"):
+        if ln.strip() == "":
+            if lines:
+                pending += 1
+            else:
+                lead += 1
+        elif _HEADER_RE.match(ln):
+            if lines:                    # header ends the current stanza (>= one blank of spacing)
+                pending = max(pending, 1)
+        else:
+            if lines:
+                break_after[-1] = pending
+            pending = 0
+            lines.append(ln.strip())
+            break_after.append(0)
+    return {"lines": lines, "break_after": break_after, "lead": lead}
+
+
+def find_stanza_ref(srt: Path):
+    """The sibling lyric file's stanza structure for `srt`, or None. Prefers the bare .plain.txt,
+    then the headed .orig.txt / .txt (whichever exists and has lines)."""
+    if srt is None:
+        return None
+    base = srt.name[:-4] if srt.name.lower().endswith(".srt") else srt.stem
+    for suffix in (".plain.txt", ".orig.txt", ".txt"):
+        cand = srt.with_name(base + suffix)
+        if not cand.exists():
+            continue
+        try:
+            data = parse_stanza(cand.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if data["lines"]:
+            data["source"] = cand.name
+            return data
+    return None
+
+
 def write_srt(cues) -> str:
     out = []
     for i, c in enumerate(cues, 1):
@@ -492,6 +544,7 @@ async function load(){
   if(d.audio_url){
     // a song was pre-loaded at launch: decode its audio, edit in place (Save writes on server)
     saveMode="server"; audioName=d.title||""; capName=d.srt_name||"";
+    stanzaRef = d.stanza || null;   // sibling .plain/.orig stanza breaks for Save TXT (may be null)
     applyCues(d.cues);
     const DEMO = /[?&]demo\b/.test(location.search);
     try {
@@ -937,6 +990,10 @@ let saveMode=null, capHandle=null, capName="", audioName="", capsPlaceholder=fal
 // re-save reproduces them: lyricLead = blank lines before the first line, and each cue carries
 // a .blanksAfter count. .srt has no place for them, so it just ignores them (stays clean).
 let lyricLead=0;
+// stanza-break template for a launched song: the sibling .plain/.orig lyric file's blank-line
+// structure, sent by the server. Overlaid onto the cues at Save TXT time (the .srt itself has
+// nowhere to store blank lines). null for a bare/dropped .srt with no sibling lyric file.
+let stanzaRef=null;
 
 // ---- SRT / plain-lyrics parsing ----
 function _tsToSec(t){ const m=t.match(/(\d+):(\d{2}):(\d{2})[,.](\d{3})/);
@@ -989,16 +1046,68 @@ function buildSRT(cues){
     .map((c,i)=>(i+1)+"\n"+_secToTs(c.start)+" --> "+_secToTs(c.end)+"\n"+(c.text||"")).join("\n\n")+"\n";
 }
 // plain lyrics: the cue text from the .srt, sorted by time, verbatim (internal line breaks /
-// whitespace preserved). One cue per line, with any remembered blank lines (leading + each cue's
-// .blanksAfter) re-inserted so a loaded-then-saved .txt keeps its original stanza breaks.
-// Text-less cues (a just-added line, or one whose text was cleared) contribute nothing to a
-// lyrics file -- skip them, so they don't emit stray blank lines that masquerade as stanza breaks.
+// whitespace preserved). One cue per line, with stanza breaks re-inserted so the saved lyrics
+// keep their verse/chorus spacing. Text-less cues (a just-added line, or one whose text was
+// cleared) contribute nothing to a lyrics file -- skip them, so they don't emit stray blank
+// lines that masquerade as stanza breaks.
+//
+// Where the breaks come from:
+//   * a loaded plain-lyrics .txt remembers its own blank lines (lyricLead + each cue's
+//     .blanksAfter), so a load->save round-trip is exact; and
+//   * a launched song's .srt has no blank lines, so we overlay them from the sibling lyric
+//     file (.plain/.orig, sent by the server as `stanzaRef`).
+// match key for aligning cue text to a reference line: lowercase, punctuation-insensitive
+// (the .srt often has trailing commas/periods the lyric sheet omits). Only used for matching --
+// the saved text is always the verbatim cue text.
+function _norm(s){ return String(s).toLowerCase().replace(/[^\p{L}\p{N}]+/gu," ").trim(); }
+// Longest-common-subsequence match of the cue texts against the reference lyric lines, so
+// retiming, text fixes, and inserted lines don't shift the alignment (and repeated lines like
+// a chorus still line up by position). Returns match[cueIndex] = reference line index, or -1
+// for a cue with no counterpart (e.g. a line you added, which isn't in the reference).
+function _lcsMatch(a, b){
+  const n=a.length, m=b.length, dp=Array.from({length:n+1},()=>new Int32Array(m+1));
+  for(let i=n-1;i>=0;i--) for(let j=m-1;j>=0;j--)
+    dp[i][j] = a[i]===b[j] ? dp[i+1][j+1]+1 : Math.max(dp[i+1][j], dp[i][j+1]);
+  const match=new Array(n).fill(-1); let i=0,j=0;
+  while(i<n && j<m){
+    if(a[i]===b[j]){ match[i]=j; i++; j++; }
+    else if(dp[i+1][j] >= dp[i][j+1]) i++; else j++;
+  }
+  return match;
+}
+// Overlay the sibling lyric file's stanza breaks onto the current cues. Each reference break
+// (after reference line j) is placed at the largest gap of silence among the cues spanning
+// that boundary -- so an inserted line glues to whichever neighbour is closer in time, and the
+// user fixes it if that guessed wrong. Returns {lead, breakAfter[]} or null if no reference.
+function overlayBreaks(sorted){
+  const ref=stanzaRef; if(!ref||!(ref.lines||[]).length) return null;
+  const match=_lcsMatch(sorted.map(c=>_norm(c.text)), ref.lines.map(_norm));
+  const refToCue={}; match.forEach((r,ci)=>{ if(r>=0) refToCue[r]=ci; });
+  const matched=Object.keys(refToCue).map(Number).sort((x,y)=>x-y);
+  const ba=ref.break_after||[], breakAfter=new Array(sorted.length).fill(0);
+  for(let j=0;j<ba.length;j++){
+    if(!(ba[j]>0)) continue;
+    let left=-1; for(const r of matched){ if(r<=j) left=r; else break; }
+    if(left<0) continue;                             // this boundary's left side was edited away
+    let right=-1; for(const r of matched){ if(r>=j+1){ right=r; break; } }
+    const a=refToCue[left], b=right>=0 ? refToCue[right] : sorted.length-1;
+    let bestK=a, best=-Infinity;                     // largest silence in cues a..b
+    for(let k=a;k<b;k++){ const g=sorted[k+1].start - sorted[k].end; if(g>best){ best=g; bestK=k; } }
+    breakAfter[bestK]=Math.max(breakAfter[bestK], ba[j]);
+  }
+  return {lead: ref.lead|0, breakAfter};
+}
 function buildTXT(cues){
   const sorted=[...cues].sort((a,b)=>a.start-b.start).filter(c=>(c.text||"").trim()!==""), out=[];
-  for(let i=0;i<lyricLead;i++) out.push("");
+  const ov = overlayBreaks(sorted);                  // stanza breaks from the sibling lyric file
+  const lead = ov ? ov.lead : lyricLead;
+  for(let i=0;i<lead;i++) out.push("");
   sorted.forEach((c,i)=>{
     out.push(c.text);
-    if(i<sorted.length-1) for(let k=0;k<(c.blanksAfter|0);k++) out.push("");
+    if(i<sorted.length-1){
+      const blanks = ov ? ov.breakAfter[i] : (c.blanksAfter|0);
+      for(let k=0;k<blanks;k++) out.push("");
+    }
   });
   return out.join("\n")+"\n";
 }
@@ -1268,6 +1377,7 @@ def make_handler():
                     "copyright": __copyright__,
                     "code": PAGE_HASH,
                     "cues": cues,
+                    "stanza": find_stanza_ref(Editor.srt),   # sibling .plain/.orig breaks for Save TXT
                 }))
             else:
                 self._send(404, json.dumps({"error": "not found"}))
