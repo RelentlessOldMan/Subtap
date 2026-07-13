@@ -37,7 +37,7 @@ from pathlib import Path
 
 # Bump __version__ by hand for real releases; the "build" number auto-increments with every
 # git commit (no build step needed), so the displayed version bumps whenever you commit.
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __copyright__ = "© 2026 RelentlessOldMan"
 
 
@@ -292,8 +292,9 @@ PAGE = r"""<!doctype html>
   button.warn { border-color:var(--danger); color:var(--danger); }
   #top { padding:12px 16px 6px; flex:0 0 auto; width:100%; max-width:1112px; align-self:center; }
   #tablewrap { flex:1 1 auto; overflow-y:auto; padding:0 16px 10px; }
-  #wavebox { position:relative; background:var(--panel); border:1px solid var(--line);
+  #wavebox { display:flex; align-items:stretch; background:var(--panel); border:1px solid var(--line);
              border-radius:8px; overflow:hidden; }
+  #wavearea { position:relative; flex:1; min-width:0; }
   #wave { display:block; width:100%; height:150px; cursor:pointer; }
   #phead { position:absolute; top:0; left:0; width:100%; height:150px; pointer-events:none; }
   #transport { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:10px 0; }
@@ -351,6 +352,17 @@ PAGE = r"""<!doctype html>
             text-shadow:0 2px 4px rgba(0,0,0,.85); }
   #tapstarts.on,#tapboth.on { background:var(--active); color:#1a1400; border-color:var(--active); font-weight:600; }
   #play,#tapboth,#tapstarts { min-width:150px; text-align:center; }   /* equal-size transport buttons */
+  #volwrap { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px;
+    flex:0 0 auto; padding:6px 10px; border-left:1px solid var(--line); background:var(--panel2); }
+  #volwrap input[type=range] { writing-mode:vertical-lr; direction:rtl; -webkit-appearance:none; appearance:none;
+    width:6px; height:96px; background:var(--line); border-radius:3px; cursor:pointer; }
+  #volwrap input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; appearance:none;
+    width:11px; height:11px; border-radius:50%; background:var(--txt); border:2px solid var(--bg);
+    box-shadow:0 0 0 1px var(--accent); }
+  #volwrap input[type=range]::-moz-range-thumb { width:11px; height:11px; border-radius:50%; background:var(--txt);
+    border:2px solid var(--bg); box-shadow:0 0 0 1px var(--accent); }
+  #volwrap input[type=range]::-moz-range-track { width:6px; background:var(--line); border-radius:3px; }
+  #volwrap input[type=range]::-moz-range-progress { width:6px; background:var(--accent); border-radius:3px; }
   #offwrap { color:var(--dim); font-size:12px; display:inline-flex; align-items:center; gap:3px; }
   #tapoffset { width:78px; background:var(--panel2); color:var(--txt); border:1px solid var(--line);
                border-radius:5px; padding:4px 6px; font-variant-numeric:tabular-nums; }
@@ -393,7 +405,7 @@ PAGE = r"""<!doctype html>
 <div id="toast"></div>
 
 <div id="top">
-  <div id="wavebox"><canvas id="wave"></canvas><canvas id="phead"></canvas></div>
+  <div id="wavebox"><div id="wavearea"><canvas id="wave"></canvas><canvas id="phead"></canvas></div><span id="volwrap" title="Subtap playback volume -- affects this app only, not your system volume"><input id="vol" type="range" min="0" max="100" value="100">🔊</span></div>
   <div id="preview"><span id="pvtext"></span></div>
   <div id="restore"></div>
   <div id="transport">
@@ -486,12 +498,16 @@ let cssW=0, cssH=0, dprCur=1, waveCache=null;
 // real number we can trust for A/V sync.
 const player = {
   ctx:null, buf:null, node:null, playing:false, startAt:0, offset:0, syncSet:false, onended:null,
-  init(ctx, buf){ this.ctx=ctx; this.buf=buf; },
+  gain:null, vol:1,                                 // Subtap-only volume, applied via a persistent GainNode
+  init(ctx, buf){ this.ctx=ctx; this.buf=buf;
+    if(ctx && ctx.createGain && !this.gain){ this.gain=ctx.createGain(); this.gain.connect(ctx.destination); }
+    if(this.gain) this.gain.gain.value=this.vol; },
+  setVolume(v){ this.vol=Math.max(0,Math.min(1,v)); if(this.gain) this.gain.gain.value=this.vol; },
   get duration(){ return this.buf ? this.buf.duration : 0; },
   get paused(){ return !this.playing; },
   position(){ const D=this.duration; let p = this.playing ? (this.ctx.currentTime-this.startAt)+this.offset : this.offset;
     if(p<0)p=0; if(D && p>D)p=D; return p; },
-  _start(off){ const n=this.ctx.createBufferSource(); n.buffer=this.buf; n.connect(this.ctx.destination);
+  _start(off){ const n=this.ctx.createBufferSource(); n.buffer=this.buf; n.connect(this.gain||this.ctx.destination);
     n.onended=()=>{ if(this.node===n){ this.playing=false; this.offset=this.duration; this.node=null; if(this.onended)this.onended(); } };
     n.start(0, off); this.node=n; this.startAt=this.ctx.currentTime; this.offset=off; this.playing=true; },
   _stop(){ if(this.node){ const n=this.node; this.node=null; try{ n.onended=null; n.stop(); }catch(e){} } },
@@ -734,7 +750,7 @@ function render(){
     tr.querySelector(".txt").addEventListener("input",e=>{ CUES[i].text=e.target.value; touch(); });
     tr.querySelector(".seek").addEventListener("click",()=>{ selectCue(i); player.seek(CUES[i].start); if(tap) retarget(i); });
     tr.querySelector(".rev").addEventListener("click",e=>{ e.stopPropagation(); revertLine(i); });
-    tr.addEventListener("mousedown",e=>{ if(e.target.tagName!=="INPUT"){ selectCue(i); if(tap) retarget(i); } });
+    tr.addEventListener("mousedown",e=>{ selectCue(i); if(tap && e.target.tagName!=="INPUT") retarget(i); });
     tb.appendChild(tr);
     setDeltas(tr,i);
   });
@@ -835,8 +851,15 @@ $("#split").addEventListener("click",()=>{
   CUES.splice(sel,1,a,b); touch(); render(); selectCue(sel);
 });
 $("#add").addEventListener("click",()=>{
-  const t=nowT(); const c={start:t,end:Math.min(dur,t+2),text:"new line"};
-  let i=CUES.findIndex(x=>x.start>t); if(i<0)i=CUES.length; CUES.splice(i,0,c); touch(); render(); selectCue(i);
+  const at=sel>=0?sel+1:CUES.length;                       // insert right after the selected row
+  const t=sel>=0?CUES[sel].end:nowT();                     // start where the selected line ends
+  const next=CUES[at];                                     // the line we're inserting before (may be undefined)
+  let end=t+2;                                             // aim for a 2s line...
+  if(next) end=Math.min(end,next.start);                   // ...but don't run into the next line
+  if(dur)  end=Math.min(end,dur);                          // ...or past the end of the song
+  if(end-t<0.5) end=t+0.5;                                 // never create a zero/negative-duration line
+  const c={start:t,end:end,text:"new line"};
+  CUES.splice(at,0,c); touch(); render(); selectCue(at);
 });
 $("#del").addEventListener("click",()=>{ if(sel<0)return; CUES.splice(sel,1); touch(); render(); selectCue(Math.min(sel,CUES.length-1)); });
 
@@ -904,6 +927,10 @@ function tapUp(){
   tapPtr++; if(tapPtr<CUES.length) selectCue(tapPtr); updateTapBanner();
 }
 $("#tapoffset").addEventListener("input",e=>{ tapOffset=Math.max(0,(parseFloat(e.target.value)||0)/1000); });
+function paintVol(el){ const v=(parseInt(el.value,10)||0);   // fill below the thumb blue to show the level (WebKit)
+  el.style.background="linear-gradient(to top, var(--accent) "+v+"%, var(--line) "+v+"%)"; }
+$("#vol").addEventListener("input",e=>{ player.setVolume((parseInt(e.target.value,10)||0)/100); paintVol(e.target); });
+paintVol($("#vol"));
 $("#tapstarts").addEventListener("click",()=>{ (tap&&tapMode===MODE.STARTS)?exitTap():enterTap(MODE.STARTS); });
 $("#tapboth").addEventListener("click",()=>{ (tap&&tapMode===MODE.STARTSTOP)?exitTap():enterTap(MODE.STARTSTOP); });
 $("#tapdone").addEventListener("click",exitTap);
