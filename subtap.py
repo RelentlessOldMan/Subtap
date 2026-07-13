@@ -37,7 +37,7 @@ from pathlib import Path
 
 # Bump __version__ by hand for real releases; the "build" number auto-increments with every
 # git commit (no build step needed), so the displayed version bumps whenever you commit.
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 __copyright__ = "© 2026 RelentlessOldMan"
 
 
@@ -381,7 +381,7 @@ PAGE = r"""<!doctype html>
       <button id="loadaudio" title="open an audio file (wav / mp3 / m4a / ogg / flac)">Load Audio</button>
       <button id="load" title="open a caption file (.srt, or a plain-lyrics .txt to tap from scratch)">Load Captions</button>
       <button class="primary" id="save" disabled>Save SRT</button>
-      <button id="savetxt" title="download the caption text as plain lyrics (one line per cue, no timings)" disabled>Save TXT</button>
+      <button id="savetxt" title="download the caption text as plain lyrics (one line per cue, no timings; stanza breaks restored from the song's lyric sheet when launched with a folder)" disabled>Save TXT</button>
       <button id="revert">Revert</button>
     </div>
     <input type="file" id="audiofile" accept="audio/*,.wav,.mp3,.m4a,.ogg,.flac,.opus" style="display:none">
@@ -971,12 +971,14 @@ async function saveServer(){
   else flash("save failed: "+(j.error||"?"));
 }
 $("#save").addEventListener("click",save);
-// Save TXT: always a download (no write-back / backups) — the caption text as plain lyrics.
+// Save TXT: always a download (no write-back / backups) — the caption text as plain lyrics,
+// with stanza breaks restored from the song's sibling lyric sheet when one was found.
 function saveTXT(){
   if(!CUES.length){ flash("Load a caption file first."); return; }
   const base = (capName||"captions").replace(/\.[^.]+$/,"").replace(/\.plain$/i,"");
   const name = base+".plain.txt";
-  _download(name, buildTXT(CUES)); flash("downloaded "+name);
+  _download(name, buildTXT(CUES));
+  flash("downloaded "+name + (stanzaRef ? "  (stanza breaks from "+stanzaRef.source+")" : ""));
 }
 $("#savetxt").addEventListener("click",saveTXT);
 $("#revert").addEventListener("click",()=>{ CUES=JSON.parse(JSON.stringify(ORIG)); dirty=false; justSaved=false; refreshSave();

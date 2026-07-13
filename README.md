@@ -34,6 +34,8 @@ truth** — nudge a line, or just hold a key and tap the lines into place as the
 - **Nudge / snap-to-playhead / drag-edges / split / add / delete**, all keyboard-friendly.
 - **Load a plain-lyrics `.txt`** and it spreads the lines evenly across the song, ready to tap
   from scratch.
+- **Save TXT** exports the caption text as plain lyrics — and when launched with a song folder,
+  it restores the **stanza breaks** from the song's own lyric sheet (see [Save TXT](#save-txt-plain-lyrics)).
 - **Numbered backups** in server mode — every save writes `<name>.srt.bak.NNN` first, so a save
   can never clobber your only copy.
 
@@ -78,6 +80,20 @@ python subtap.py "Artist/Song" --port 8756 --no-browser
 | **Firefox / Safari** (files opened in the UI) | download fallback | Downloads the edited `.srt` (those browsers can't write local files). |
 
 The stats bar shows the current mode (`save:write-back` / `save:download`).
+
+### Save TXT (plain lyrics)
+
+**Save TXT** downloads the caption text as a plain-lyrics `<name>.plain.txt` — one line per cue,
+no timings. An `.srt` has no place to store blank lines, so on its own the export is one solid
+block. But when you launch Subtap with a **song folder**, it looks for a sibling lyric sheet
+(`<name>.plain.txt`, else `<name>.orig.txt`/`<name>.txt`, section headers like `**[Chorus]**`
+stripped) and overlays *its* **stanza breaks** onto the export.
+
+The breaks are matched to your cues by text — not by line number — so retiming, text fixes, and
+even reordered or repeated lines (a chorus) still line up. A line you **added** in Subtap isn't in
+the lyric sheet, so it glues to whichever neighbour is closer in time; nudge it if that guessed
+wrong. A bare `.srt` opened from the browser (no folder) has no lyric sheet to draw on, so it
+exports without breaks — faithful to the `.srt`.
 
 ## How it works
 
