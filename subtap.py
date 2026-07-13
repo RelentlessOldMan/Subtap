@@ -8,7 +8,7 @@ each caption -- nudge start/end, snap them to the playhead, tap-sync a section b
 waveform, split a line, and edit the text. Per-line deltas show exactly what moved and a
 one-click revert undoes any line; overlaps are flagged in red. Save writes straight back
 to the song's .srt (keeping numbered <name>.srt.bak.NNN backups). Pure Python standard
-library -- no pip install.
+library for the core; pywebview is an optional extra for the desktop window (below).
 
 Two ways to run it:
   * Bare -- `python subtap.py` -- just hosts the editor; open your own audio + caption files
@@ -17,9 +17,17 @@ Two ways to run it:
   * Pre-loaded -- `python subtap.py "<folder>"` -- a folder holding one .mp3 + one .srt is loaded
     on launch and Save writes back in place, keeping numbered `<name>.srt.bak.NNN` backups.
 
+Desktop window (optional): if `pywebview` is installed (`pip install pywebview`), Subtap opens in
+its own app window instead of a browser tab. There, Load Audio / Load Captions use native file
+dialogs, which give Subtap the real path on disk -- so it can read a picked .srt's sibling lyric
+sheet (Save TXT restores stanza breaks with no folder launch) and it remembers the audio + captions
+you had open, silently reloading them next launch. The tap-sync offset and volume are remembered
+too (in both modes). Pass --browser to force the plain browser UI even when pywebview is available.
+
 Usage:
-    python subtap.py                       # open files from the browser
+    python subtap.py                       # open files (desktop window if pywebview, else browser)
     python subtap.py "Hello, World"        # pre-load a song folder (save in place)
+    python subtap.py --browser             # force the browser UI (skip the desktop window)
     python subtap.py "Artist/Song" --port 8756 --no-browser
 """
 from __future__ import annotations
@@ -37,8 +45,13 @@ from pathlib import Path
 
 # Bump __version__ by hand for real releases; the "build" number auto-increments with every
 # git commit (no build step needed), so the displayed version bumps whenever you commit.
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __copyright__ = "© 2026 RelentlessOldMan"
+
+
+# Windows: keep console-app subprocesses (git) from flashing a console window when Subtap runs
+# under pythonw (the desktop app has no console for them to inherit). A no-op on other platforms.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _version_string() -> str:
@@ -47,7 +60,8 @@ def _version_string() -> str:
 
     def _git(*args):
         return subprocess.run(["git", "-C", str(repo), *args],
-                              capture_output=True, text=True, timeout=3).stdout.strip()
+                              capture_output=True, text=True, timeout=3,
+                              creationflags=_NO_WINDOW).stdout.strip()
     try:
         n = _git("rev-list", "--count", "HEAD")
         h = _git("rev-parse", "--short", "HEAD")
@@ -188,6 +202,124 @@ def find_stanza_ref(srt: Path):
             data["source"] = cand.name
             return data
     return None
+
+
+def read_captions_ref(path_str: str):
+    """Read a caption file the user picked through the native (desktop) file dialog, plus the
+    stanza breaks from its sibling lyric sheet. A browser can't see a picked file's neighbours on
+    disk; the desktop window hands us the real path, so Save TXT can restore blank lines without a
+    folder launch. Returns {"name", "text", "stanza"} or {"error": ...}."""
+    try:
+        p = Path(path_str)
+        text = p.read_text(encoding="utf-8")
+    except OSError as e:
+        return {"error": str(e)}
+    # Only an .srt needs the overlay -- a plain-lyrics .txt already carries its own blank lines --
+    # and only an .srt becomes a Save-back target (writing .srt cues into a .txt would be wrong).
+    is_srt = p.suffix.lower() == ".srt"
+    stanza = find_stanza_ref(p) if is_srt else None
+    return {"name": p.name, "text": text, "stanza": stanza, "server": is_srt}
+
+
+# Desktop session: the real paths of the last audio + captions the user opened, so the desktop
+# window can silently reload them next launch (the browser can't -- it only keeps opaque handles).
+# A single small JSON file in the user's home; anything unreadable/missing is treated as "no
+# session" and never breaks startup.
+SESSION_FILE = Path.home() / ".subtap" / "session.json"
+
+
+def load_session() -> dict:
+    try:
+        data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_session(**fields):
+    """Merge the given non-None fields (audio / srt paths) into the saved session."""
+    data = load_session()
+    data.update({k: v for k, v in fields.items() if v is not None})
+    try:
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SESSION_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+
+
+class DesktopAPI:
+    """Bridge exposed to the page as window.pywebview.api when Subtap runs in its own desktop
+    window. Opens native file dialogs and reads the real files (and a caption file's sibling lyric
+    sheet) -- the file access a sandboxed browser tab can't give us -- and remembers them across
+    launches via the session file."""
+
+    def _pick(self, file_types):
+        import webview
+        wins = webview.windows
+        if not wins:
+            return None
+        picked = wins[0].create_file_dialog(
+            webview.OPEN_DIALOG, allow_multiple=False, file_types=file_types)
+        return picked[0] if picked else None      # None if the user cancelled
+
+    def pick_captions(self):
+        path = self._pick(("Captions (*.srt;*.txt)", "All files (*.*)"))
+        if not path:
+            return None
+        ref = read_captions_ref(path)
+        if "error" not in ref:
+            if ref.get("server"):
+                Editor.save_target = Path(path)   # Save SRT/TXT now write here (with backups)
+            save_session(srt=path)                # remember for next launch
+        return ref
+
+    def pick_audio(self):
+        path = self._pick(
+            ("Audio (*.mp3;*.wav;*.m4a;*.mp4;*.ogg;*.opus;*.flac;*.aac)", "All files (*.*)"))
+        if not path:
+            return None
+        return self._use_audio(path, remember=True)
+
+    def _use_audio(self, path, remember):
+        """Point the /media endpoint at `path` so the page can fetch + decode it; optionally
+        remember it in the session. Returns {name, audio_url} or {error}."""
+        p = Path(path)
+        try:
+            size = p.stat().st_size          # existence + a cache-buster for the fixed media URL
+        except OSError as e:
+            return {"error": str(e)}
+        Editor.mp3 = p
+        if remember:
+            save_session(audio=str(p))
+        return {"name": p.name, "audio_url": f"{AUDIO_URL}?v={size}"}
+
+    def resume_session(self):
+        """Reload the last session's audio + captions (by real path). Called once on desktop
+        launch. Missing/moved files are quietly skipped. Returns {audio?, srt?} or None."""
+        sess = load_session()
+        out = {}
+        a = sess.get("audio")
+        if a and Path(a).exists():
+            audio = self._use_audio(a, remember=False)
+            if "error" not in audio:
+                out["audio"] = audio
+        s = sess.get("srt")
+        if s and Path(s).exists():
+            ref = read_captions_ref(s)
+            if "error" not in ref:
+                if ref.get("server"):
+                    Editor.save_target = Path(s)
+                out["srt"] = ref
+        return out or None
+
+
+def _desktop_available() -> bool:
+    """True if the optional pywebview desktop window can be used; False -> plain browser mode."""
+    try:
+        import webview  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 def write_srt(cues) -> str:
@@ -393,7 +525,7 @@ PAGE = r"""<!doctype html>
       <button id="loadaudio" title="open an audio file (wav / mp3 / m4a / ogg / flac)">Load Audio</button>
       <button id="load" title="open a caption file (.srt, or a plain-lyrics .txt to tap from scratch)">Load Captions</button>
       <button class="primary" id="save" disabled>Save SRT</button>
-      <button id="savetxt" title="download the caption text as plain lyrics (one line per cue, no timings; stanza breaks restored from the song's lyric sheet when launched with a folder)" disabled>Save TXT</button>
+      <button id="savetxt" title="save the caption text as plain lyrics (one line per cue, no timings; stanza breaks restored from the song's lyric sheet). Writes &lt;name&gt;.plain.txt next to the .srt (with a backup) in the desktop app or a launched folder; downloads otherwise" disabled>Save TXT</button>
       <button id="revert">Revert</button>
     </div>
     <input type="file" id="audiofile" accept="audio/*,.wav,.mp3,.m4a,.ogg,.flac,.opus" style="display:none">
@@ -473,7 +605,7 @@ const $ = s => document.querySelector(s);
 // and MODE.* are used as keys into TAP_HELP -- so the values must stay exactly these.
 const MODE = { STARTS:"starts", STARTSTOP:"startstop" };
 const DRAG = { START:"start", END:"end", SCRUB:"scrub" };
-const API  = { DATA:"/api/data", SAVE:"/api/save" };   // must match the Python routes below
+const API  = { DATA:"/api/data", SAVE:"/api/save", SAVETXT:"/api/savetxt" };   // must match the Python routes below
 
 // Canvas colors in ONE place: the solids mirror the CSS custom properties (single source of
 // truth for the theme), the alpha/canvas-only shades are noted inline.
@@ -576,9 +708,36 @@ async function load(){
     if(DEMO) applyDemoPose();   // fake edits + tap-sync pose on top of the real (or synthetic) waveform
   } else {
     applyCues([]);   // bare: open your own audio + caption files from the top-bar buttons
-    tryRestore();    // ...or auto-reload the last session's files if we remember them
+    // ...or auto-reload the last session's files. Desktop: silently, by real path (also re-finds
+    // the lyric sheet for stanza breaks). Browser: a one-click reload of the stored handles.
+    if(await desktopReady()) resumeDesktopSession();
+    else tryRestore();
   }
   frame();
+}
+// Resolve true once the desktop (pywebview) bridge is usable, false in a plain browser. pywebview
+// injects window.pywebview.api a tick after the page scripts run, so we wait for its ready event
+// (with a short timeout) rather than racing it at startup.
+function desktopReady(){
+  return new Promise(res=>{
+    if(!window.pywebview) return res(false);                 // plain browser -> no bridge
+    if(window.pywebview.api && window.pywebview.api.resume_session) return res(true);
+    window.addEventListener("pywebviewready", ()=>res(!!(window.pywebview.api&&window.pywebview.api.resume_session)), {once:true});
+    setTimeout(()=>res(!!(window.pywebview.api&&window.pywebview.api.resume_session)), 2000);
+  });
+}
+// Desktop-only: reload the audio + captions the user last had open, by their real path on disk.
+async function resumeDesktopSession(){
+  let r; try{ r = await window.pywebview.api.resume_session(); }catch(e){ return; }
+  if(!r) return;
+  if(r.audio && r.audio.audio_url){
+    try{ await loadAudioBuffer(await (await fetch(r.audio.audio_url)).arrayBuffer(), r.audio.name); }
+    catch(e){ console.warn("resume audio failed", e); }
+  }
+  if(r.srt && r.srt.text){                      // captions after audio, so a .txt spreads over the real length
+    setCaptions(parseCaptions(r.srt.text), r.srt.name, null, r.srt.stanza, r.srt.server ? "server" : null);
+    flash("reloaded "+r.srt.name + (r.srt.stanza ? "  (stanza breaks from "+r.srt.stanza.source+")" : ""));
+  }
 }
 
 // Synthetic waveform for the demo screenshot (real decodeAudioData hangs in headless Chrome).
@@ -721,7 +880,7 @@ function frame(){
     const loaded = "code "+codeHash+"   ·   "
       + (audioName?("♪ "+audioName+"   ·   "):"")
       + (capName?("▤ "+capName+" ("+CUES.length+" lines)   ·   "):"")
-      + (saveMode?("save:"+(saveMode==="handle"?"write-back":saveMode)+"   ·   "):"")
+      + (saveMode?("save:"+(saveMode==="download"?"download":"write-back")+"   ·   "):"")
       + "fs:"+(window.showOpenFilePicker?"on":"off")+"   ·   ";
     const ds = loaded + "A/V sync "+Math.round(avSync*1000)+"ms applied   ·   outLat "+Math.round(ol*1000)
       +"ms  baseLat "+Math.round(bl*1000)+"ms   ·   tap −"+Math.round(tapOffset*1000)+"ms"
@@ -926,11 +1085,25 @@ function tapUp(){
   touch(); updateRow(tapPtr); drawWave(); $("#holdbtn").classList.remove("held");
   tapPtr++; if(tapPtr<CUES.length) selectCue(tapPtr); updateTapBanner();
 }
-$("#tapoffset").addEventListener("input",e=>{ tapOffset=Math.max(0,(parseFloat(e.target.value)||0)/1000); });
+$("#tapoffset").addEventListener("input",e=>{ tapOffset=Math.max(0,(parseFloat(e.target.value)||0)/1000);
+  prefSet("tapoffset", Math.round(tapOffset*1000)); });
 function paintVol(el){ const v=(parseInt(el.value,10)||0);   // fill below the thumb blue to show the level (WebKit)
   el.style.background="linear-gradient(to top, var(--accent) "+v+"%, var(--line) "+v+"%)"; }
-$("#vol").addEventListener("input",e=>{ player.setVolume((parseInt(e.target.value,10)||0)/100); paintVol(e.target); });
+$("#vol").addEventListener("input",e=>{ const v=parseInt(e.target.value,10)||0;
+  player.setVolume(v/100); paintVol(e.target); prefSet("vol", v); });
 paintVol($("#vol"));
+// Remembered UI prefs -- the tap-sync ("old man") offset and Subtap volume -- kept in localStorage
+// so they survive across sessions in both the browser and the desktop window. (Files are remembered
+// separately: handles via IndexedDB in the browser, real paths via the server in the desktop app.)
+function prefGet(k,d){ try{ const v=localStorage.getItem("subtap."+k); return v===null?d:v; }catch(e){ return d; } }
+function prefSet(k,v){ try{ localStorage.setItem("subtap."+k, String(v)); }catch(e){} }
+function restorePrefs(){
+  const off=parseFloat(prefGet("tapoffset",""));
+  if(!isNaN(off) && off>=0){ $("#tapoffset").value=Math.round(off); tapOffset=off/1000; }
+  const vol=parseInt(prefGet("vol",""),10);
+  if(!isNaN(vol) && vol>=0 && vol<=100){ $("#vol").value=vol; player.setVolume(vol/100); }
+  paintVol($("#vol"));
+}
 $("#tapstarts").addEventListener("click",()=>{ (tap&&tapMode===MODE.STARTS)?exitTap():enterTap(MODE.STARTS); });
 $("#tapboth").addEventListener("click",()=>{ (tap&&tapMode===MODE.STARTSTOP)?exitTap():enterTap(MODE.STARTSTOP); });
 $("#tapdone").addEventListener("click",exitTap);
@@ -991,21 +1164,34 @@ async function saveServer(){
     body:JSON.stringify({cues:CUES})});
   const j=await r.json();
   if(j.ok){
-    // reload exactly what's on disk (server sorted/cleaned it) -> guaranteed-clean new baseline
-    try { const d=await (await fetch(API.DATA)).json(); applyCues(d.cues, {justSaved:true}); }
-    catch(err){ applyCues(CUES, {justSaved:true}); }
+    // the server sorted/cleaned the cues and echoed them back -> a guaranteed-clean new baseline
+    applyCues(j.cues||CUES, {justSaved:true});
+    flash("saved "+(j.name||"")+(j.backup?"  (backup "+j.backup+")":""));
   }
   else flash("save failed: "+(j.error||"?"));
 }
 $("#save").addEventListener("click",save);
-// Save TXT: always a download (no write-back / backups) — the caption text as plain lyrics,
-// with stanza breaks restored from the song's sibling lyric sheet when one was found.
-function saveTXT(){
+// Save TXT: the caption text as plain lyrics, with stanza breaks restored from the sibling lyric
+// sheet. In server mode (folder launch / desktop app) it writes <name>.plain.txt next to the .srt
+// with a numbered backup; otherwise it downloads.
+async function saveTXT(){
   if(!CUES.length){ flash("Load a caption file first."); return; }
+  const text = buildTXT(CUES);
+  const src = stanzaRef ? "  (stanza breaks from "+stanzaRef.source+")" : "";
+  if(saveMode==="server"){
+    try {
+      const r=await fetch(API.SAVETXT,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({text})});
+      const j=await r.json();
+      if(j.ok) flash("saved "+j.name+(j.backup?"  (backup "+j.backup+")":"")+src);
+      else flash("save failed: "+(j.error||"?"));
+    } catch(err){ flash("save failed: "+(err.message||err)); }
+    return;
+  }
   const base = (capName||"captions").replace(/\.[^.]+$/,"").replace(/\.plain$/i,"");
   const name = base+".plain.txt";
-  _download(name, buildTXT(CUES));
-  flash("downloaded "+name + (stanzaRef ? "  (stanza breaks from "+stanzaRef.source+")" : ""));
+  _download(name, text);
+  flash("downloaded "+name + src);
 }
 $("#savetxt").addEventListener("click",saveTXT);
 $("#revert").addEventListener("click",()=>{ CUES=JSON.parse(JSON.stringify(ORIG)); dirty=false; justSaved=false; refreshSave();
@@ -1019,9 +1205,10 @@ let saveMode=null, capHandle=null, capName="", audioName="", capsPlaceholder=fal
 // re-save reproduces them: lyricLead = blank lines before the first line, and each cue carries
 // a .blanksAfter count. .srt has no place for them, so it just ignores them (stays clean).
 let lyricLead=0;
-// stanza-break template for a launched song: the sibling .plain/.orig lyric file's blank-line
-// structure, sent by the server. Overlaid onto the cues at Save TXT time (the .srt itself has
-// nowhere to store blank lines). null for a bare/dropped .srt with no sibling lyric file.
+// stanza-break template: the sibling .plain/.orig lyric file's blank-line structure. Set either
+// by a launched song (server sends it) or by Load Captions in the desktop app (native dialog gives
+// the real path, so the server can find the sibling). Overlaid onto the cues at Save TXT time (the
+// .srt itself has nowhere to store blank lines). null for a bare/dropped .srt with no sibling.
 let stanzaRef=null;
 
 // ---- SRT / plain-lyrics parsing ----
@@ -1165,6 +1352,16 @@ async function loadAudioBuffer(arrbuf, name){
 async function openAudioHandle(h){ const f=await h.getFile();
   await loadAudioBuffer(await f.arrayBuffer(), f.name); idbSet("audio", h); }
 $("#loadaudio").addEventListener("click", async ()=>{
+  // Desktop window: native dialog -> real path; the server serves it and remembers it for next launch.
+  if(window.pywebview && window.pywebview.api && window.pywebview.api.pick_audio){
+    try {
+      const r = await window.pywebview.api.pick_audio();
+      if(!r) return;                                   // cancelled
+      if(r.error){ flash("open failed: "+r.error); return; }
+      await loadAudioBuffer(await (await fetch(r.audio_url)).arrayBuffer(), r.name);
+    } catch(err){ flash("couldn't load audio — "+(err.message||err)); }
+    return;
+  }
   if(window.showOpenFilePicker){
     try {
       const [h] = await window.showOpenFilePicker({ types:[{ description:"Audio",
@@ -1182,23 +1379,37 @@ $("#audiofile").addEventListener("change", async e=>{
 });
 
 // ---- captions: File System Access (write-back) when available, else a file input (download) ----
-function setCaptions(cues, name, handle){
-  capHandle=handle||null; capName=name||"captions.srt"; saveMode = handle ? "handle" : "download";
+function setCaptions(cues, name, handle, stanza, mode){
+  capHandle=handle||null; capName=name||"captions.srt";
+  saveMode = mode || (handle ? "handle" : "download");   // desktop .srt -> "server" (write-back)
+  if(stanza!==undefined) stanzaRef = stanza || null;   // desktop: sibling lyric breaks for Save TXT
   applyCues(cues);   // fresh baseline: deltas blank, not dirty (filename + count show in the stats bar)
 }
 $("#load").addEventListener("click", async ()=>{
+  // Desktop window: a native dialog gives us the real path, so the server reads the picked
+  // .srt's sibling lyric sheet -> Save TXT restores blank lines with no folder launch, no prompt.
+  if(window.pywebview && window.pywebview.api && window.pywebview.api.pick_captions){
+    try {
+      const r = await window.pywebview.api.pick_captions();
+      if(!r) return;                                   // cancelled
+      if(r.error){ flash("open failed: "+r.error); return; }
+      setCaptions(parseCaptions(r.text), r.name, null, r.stanza, r.server ? "server" : null);
+      flash("loaded "+r.name + (r.stanza ? "  (stanza breaks from "+r.stanza.source+")" : ""));
+    } catch(err){ flash("open failed: "+(err.message||err)); }
+    return;
+  }
   if(window.showOpenFilePicker){
     try {
       const [h] = await window.showOpenFilePicker({ types:[{ description:"Captions",
         accept:{"text/plain":[".srt",".txt"]} }] });
       const f = await h.getFile();
-      setCaptions(parseCaptions(await f.text()), f.name, h); idbSet("caps", h);
+      setCaptions(parseCaptions(await f.text()), f.name, h, null); idbSet("caps", h);
     } catch(err){ if(err.name!=="AbortError") flash("open failed: "+err.message); }
   } else { $("#loadfile").click(); }
 });
 $("#loadfile").addEventListener("change", async e=>{
   const f=e.target.files[0]; e.target.value=""; if(!f) return;
-  setCaptions(parseCaptions(await f.text()), f.name, null);   // no handle -> Save downloads
+  setCaptions(parseCaptions(await f.text()), f.name, null, null);   // no handle -> Save downloads
 });
 
 // ===== remember the last audio + caption files across refreshes (Chrome/Edge; graceful else) =====
@@ -1283,7 +1494,7 @@ window.addEventListener("keydown",e=>{
 window.addEventListener("keyup",e=>{ if(e.key==="Control"&&keyHold){ keyHold=false; tapUp(); } });
 window.addEventListener("beforeunload",e=>{ if(dirty){ e.preventDefault(); e.returnValue=""; } });
 window.addEventListener("resize", sizeCanvas);
-sizeCanvas(); load();
+sizeCanvas(); restorePrefs(); load();
 </script>
 </body></html>
 """
@@ -1296,6 +1507,7 @@ sizeCanvas(); load();
 # HTTP routes -- keep in sync with the JS `API` object and `audio_url` in PAGE above.
 ROUTE_DATA = "/api/data"
 ROUTE_SAVE = "/api/save"
+ROUTE_SAVETXT = "/api/savetxt"
 MEDIA_PREFIX = "/media/audio"
 AUDIO_URL = "/media/audio.mp3"
 
@@ -1322,7 +1534,8 @@ _RANGE_RE = re.compile(r"bytes=(\d+)-(\d*)")
 
 class Editor:
     mp3: Path = None
-    srt: Path = None
+    srt: Path = None          # pre-loaded song srt (folder launch) -- drives /api/data
+    save_target: Path = None  # where Save writes in the desktop app (the picked/resumed .srt)
     title: str = ""
     version: str = ""
 
@@ -1412,23 +1625,52 @@ def make_handler():
                 self._send(404, json.dumps({"error": "not found"}))
 
         def do_POST(self):
-            if self.path != ROUTE_SAVE:
+            if self.path == ROUTE_SAVE:
+                self._save_srt()
+            elif self.path == ROUTE_SAVETXT:
+                self._save_txt()
+            else:
                 self._send(404, json.dumps({"error": "not found"}))
-                return
+
+        def _body(self):
+            n = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(n).decode("utf-8"))
+
+        def _save_srt(self):
+            # Writes to save_target (the .srt picked in the desktop app) or Editor.srt (folder
+            # launch). Numbered rolling backup before overwrite; overlaps are left exactly as
+            # authored (the editor flags them in red) -- we intentionally do NOT trim ends here.
+            target = Editor.save_target or Editor.srt
             try:
-                n = int(self.headers.get("Content-Length", 0))
-                data = json.loads(self.rfile.read(n).decode("utf-8"))
-                cues = _clean_cues(data.get("cues"))
+                if target is None:
+                    raise RuntimeError("no file to save to")
+                cues = _clean_cues(self._body().get("cues"))
                 cues.sort(key=lambda c: c["start"])
-                # overlaps are left exactly as authored (the editor flags them in red) --
-                # we intentionally do NOT trim ends here.
-                bak = _make_backup(Editor.srt)   # numbered rolling backup before overwrite
-                Editor.srt.write_text(write_srt(cues), encoding="utf-8")
-                self._send(200, json.dumps({"ok": True, "cues": len(cues),
-                                            "name": Editor.srt.name,
+                bak = _make_backup(target)
+                target.write_text(write_srt(cues), encoding="utf-8")
+                self._send(200, json.dumps({"ok": True, "cues": cues,
+                                            "name": target.name,
                                             "backup": bak.name if bak else None}))
-                print(f"saved {len(cues)} cues -> {Editor.srt.name}"
+                print(f"saved {len(cues)} cues -> {target.name}"
                       + (f"  (backup: {bak.name})" if bak else ""))
+            except Exception as e:  # noqa
+                self._send(200, json.dumps({"ok": False, "error": str(e)}))
+
+        def _save_txt(self):
+            # Writes the plain-lyrics export next to the .srt as <name>.plain.txt. That file may be
+            # the very lyric sheet we read stanza breaks from, so we always back it up first.
+            target = Editor.save_target or Editor.srt
+            try:
+                if target is None:
+                    raise RuntimeError("no folder to save into")
+                text = str(self._body().get("text", ""))
+                base = target.name[:-4] if target.name.lower().endswith(".srt") else target.stem
+                out = target.with_name(base + ".plain.txt")
+                bak = _make_backup(out)
+                out.write_text(text, encoding="utf-8")
+                self._send(200, json.dumps({"ok": True, "name": out.name,
+                                            "backup": bak.name if bak else None}))
+                print(f"saved lyrics -> {out.name}" + (f"  (backup: {bak.name})" if bak else ""))
             except Exception as e:  # noqa
                 self._send(200, json.dumps({"ok": False, "error": str(e)}))
     return H
@@ -1442,6 +1684,8 @@ def main():
     ap.add_argument("--srt", default=None, help="Specific .srt to edit (with song_dir)")
     ap.add_argument("--port", type=int, default=8756, help="Port (default: 8756; auto-bumps if busy)")
     ap.add_argument("--no-browser", action="store_true", help="Don't auto-open the browser")
+    ap.add_argument("--browser", action="store_true",
+                    help="Force the browser UI even when the desktop window (pywebview) is available")
     args = ap.parse_args()
 
     # song_dir is OPTIONAL. With it, Subtap pre-loads that song and Save writes back in place
@@ -1479,6 +1723,26 @@ def main():
     else:
         print("no song pre-loaded -- open your audio + caption files from the browser")
     print(f"editor : {url}")
+
+    # Desktop window (optional pywebview): its native file dialog hands us the real file path, so
+    # Load Captions can read a picked .srt's sibling lyric sheet -- something a sandboxed browser
+    # tab can't do. Skipped for --browser (force browser UI) and --no-browser (stay headless).
+    if _desktop_available() and not args.browser and not args.no_browser:
+        import threading
+        import webview
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        print("window : native desktop (pywebview) -- Load Captions reads sibling lyric files directly")
+        print("close the window to stop.")
+        # 1280x840 is both the starting size and the floor -- the user can enlarge but not shrink
+        # below it, so the toolbar + waveform + line list always have room.
+        webview.create_window("Subtap", url, js_api=DesktopAPI(),
+                              width=1280, height=840, min_size=(1280, 840))
+        try:
+            webview.start()
+        finally:
+            httpd.shutdown()
+        return
+
     print("Ctrl+C to stop.")
     if not args.no_browser:
         webbrowser.open(url)
