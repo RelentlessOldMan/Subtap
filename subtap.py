@@ -391,6 +391,14 @@ PAGE = r"""<!doctype html>
           --txt:#e6e8ee; --dim:#9aa0b0; --accent:#4fd1ff; --active:#ffd24f;
           --danger:#ff6b6b; --ok:#4fe08a; }
   * { box-sizing:border-box; }
+  /* Themed scrollbars (WebView2/Chromium) so they don't fall back to the native OS bar */
+  * { scrollbar-color:var(--panel2) var(--bg); scrollbar-width:thin; }
+  ::-webkit-scrollbar { width:10px; height:10px; }
+  ::-webkit-scrollbar-track { background:var(--bg); }
+  ::-webkit-scrollbar-thumb { background:var(--panel2); border:2px solid var(--bg);
+    border-radius:6px; }
+  ::-webkit-scrollbar-thumb:hover { background:var(--line); }
+  ::-webkit-scrollbar-corner { background:var(--bg); }
   html,body { height:100%; }
   body { margin:0; background:var(--bg); color:var(--txt);
          font:14px/1.4 system-ui,Segoe UI,Roboto,Arial,sans-serif;
