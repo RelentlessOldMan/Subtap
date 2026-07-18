@@ -1745,8 +1745,14 @@ def main():
         # below it, so the toolbar + waveform + line list always have room.
         webview.create_window("Subtap", url, js_api=DesktopAPI(),
                               width=1280, height=840, min_size=(1280, 840))
+        # Taskbar/titlebar icon: without this the window inherits pythonw.exe's
+        # generic ".py document" icon. Look for subtap.ico next to us -- when
+        # frozen by PyInstaller it lands in the bundle dir (sys._MEIPASS); as a
+        # plain script it sits beside subtap.py. Missing icon is non-fatal.
+        _here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        _icon = _here / "subtap.ico"
         try:
-            webview.start()
+            webview.start(icon=str(_icon) if _icon.exists() else None)
         finally:
             httpd.shutdown()
         return

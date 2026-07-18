@@ -14,6 +14,15 @@ straight back to your `.srt`. (One *optional* extra — `pywebview` — gives it
 
 > *Want to see it populated without loading anything? Run it and visit `http://localhost:8756/?demo=1`.*
 
+## Download
+
+- **Windows — no Python needed:** grab **`Subtap.exe`** from the
+  [latest release](https://github.com/RelentlessOldMan/Subtap/releases/latest) and double-click it.
+  (It's an unsigned app, so the first launch may show a SmartScreen *"Windows protected your PC"*
+  prompt — click **More info → Run anyway**; you only do this once per download.)
+- **Any OS with Python:** download **`subtap.py`** from the same release and run `python subtap.py`.
+  Nothing to install — it's pure standard library.
+
 ## Why
 
 Forced-alignment tools (Whisper, stable-ts, etc.) get you 90% of the way, but reverb, held notes,

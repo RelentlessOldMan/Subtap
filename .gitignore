@@ -5,6 +5,11 @@ __pycache__/
 .venv/
 venv/
 
+# PyInstaller build output (run make_icon.py + build to regenerate)
+build/
+dist/
+*.spec
+
 # Editor / OS
 .vscode/
 .idea/

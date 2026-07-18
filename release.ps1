@@ -1,6 +1,7 @@
 <#
   Cut a Subtap release in one shot: bump __version__ (patch) in subtap.py -> commit + tag + push
-  -> create the GitHub release with subtap.py attached (people download one file, no build).
+  -> build Subtap.exe -> create the GitHub release with subtap.py AND Subtap.exe attached
+  (Python users download one file; Windows users download the exe and just double-click, no build).
 
   Commit your actual changes first (this only commits the version bump), then run:
     powershell -ExecutionPolicy Bypass -File .\release.ps1            # bump patch (1.0.0 -> 1.0.1)
@@ -37,14 +38,22 @@ git tag "v$ver"
 git push --quiet origin main
 git push --quiet origin "v$ver"
 
-# 5. Create the GitHub release with subtap.py attached.
+# 5. Build the standalone Windows exe from the just-bumped source, so its version matches the tag.
+& "$PSScriptRoot\build.ps1"
+$exe = "$PSScriptRoot\dist\Subtap.exe"
+if (-not (Test-Path $exe)) { throw "Build did not produce dist\Subtap.exe - aborting release." }
+
+# 6. Create the GitHub release with BOTH subtap.py and Subtap.exe attached.
 $notes = @"
 **Subtap v$ver** - a single-file, dependency-free caption timing editor (waveform, tap-sync, deltas).
 
-No install: download subtap.py below and run:  python subtap.py
+**Windows (no Python):** download **Subtap.exe** below and double-click. First launch may show an
+unsigned-app SmartScreen prompt -- click **More info -> Run anyway** (once per download).
+
+**Any OS with Python:** download **subtap.py** and run:  python subtap.py
 
 See the README for usage: https://github.com/RelentlessOldMan/Subtap#readme
 "@
-gh release create "v$ver" subtap.py --title "Subtap v$ver" --notes $notes
+gh release create "v$ver" subtap.py $exe --title "Subtap v$ver" --notes $notes
 
 Write-Host "`nReleased v$ver -> https://github.com/RelentlessOldMan/Subtap/releases/tag/v$ver"
