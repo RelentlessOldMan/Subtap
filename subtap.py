@@ -45,7 +45,7 @@ from pathlib import Path
 
 # Bump __version__ by hand for real releases; the "build" number auto-increments with every
 # git commit (no build step needed), so the displayed version bumps whenever you commit.
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 __copyright__ = "© 2026 RelentlessOldMan"
 
 
