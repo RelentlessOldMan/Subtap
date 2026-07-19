@@ -912,8 +912,14 @@ function render(){
       '<td class="spacer"></td>'+
       '<td class="rowacts"><button class="rowbtn seek" title="select + seek here">↦</button></td>'+
       '<td class="textcell"><input class="txt" value="'+esc(c.text.replace(/\n/g,"  "))+'"></td>';
-    tr.querySelector(".s").addEventListener("change",e=>{ CUES[i].start=parseFloat(e.target.value)||0; touch(); drawWave(); });
-    tr.querySelector(".e").addEventListener("change",e=>{ CUES[i].end=parseFloat(e.target.value)||0; touch(); drawWave(); });
+    // Live: as you type a time, repaint that row's duration + deltas + overlap flags (paintRow
+    // leaves the box you're editing alone). On commit (Enter/blur) updateRow also normalizes the
+    // box to 2 decimals. Without paintRow here, the deltas would stay stale after a manual edit.
+    const sBox=tr.querySelector(".s"), eBox=tr.querySelector(".e");
+    sBox.addEventListener("input", e=>{ CUES[i].start=parseFloat(e.target.value)||0; touch(); paintRow(i); drawWave(); });
+    eBox.addEventListener("input", e=>{ CUES[i].end  =parseFloat(e.target.value)||0; touch(); paintRow(i); drawWave(); });
+    sBox.addEventListener("change",()=>updateRow(i));
+    eBox.addEventListener("change",()=>updateRow(i));
     tr.querySelector(".txt").addEventListener("input",e=>{ CUES[i].text=e.target.value; touch(); });
     tr.querySelector(".seek").addEventListener("click",()=>{ selectCue(i); player.seek(CUES[i].start); if(tap) retarget(i); });
     tr.querySelector(".rev").addEventListener("click",e=>{ e.stopPropagation(); revertLine(i); });
@@ -963,6 +969,12 @@ function updateRow(i){
   const r=document.querySelector('tr.cue[data-i="'+i+'"]'); const c=CUES[i]; if(!r||!c)return;
   r.querySelector(".s").value=c.start.toFixed(2);
   r.querySelector(".e").value=c.end.toFixed(2);
+  paintRow(i);
+}
+// Repaint everything derived from a cue's times -- duration, deltas, overlap flags -- WITHOUT
+// rewriting the editable start/end boxes, so it's safe to call while the user is typing in one.
+function paintRow(i){
+  const r=document.querySelector('tr.cue[data-i="'+i+'"]'); const c=CUES[i]; if(!r||!c)return;
   r.querySelector(".durval").textContent=(c.end-c.start).toFixed(2);
   r.querySelector(".dur").classList.toggle("warnflag",isInverted(i));
   setDeltas(r,i);
