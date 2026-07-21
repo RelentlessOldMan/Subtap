@@ -35,17 +35,22 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import time
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # Bump __version__ by hand for real releases; the "build" number auto-increments with every
 # git commit (no build step needed), so the displayed version bumps whenever you commit.
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 __copyright__ = "© 2026 RelentlessOldMan"
 
 
@@ -408,7 +413,9 @@ PAGE = r"""<!doctype html>
   header .bar { display:flex; align-items:center; gap:12px; padding:10px 16px;
                 width:100%; max-width:1112px; }
   header h1 { font-size:15px; margin:0; font-weight:600; }
-  #ver { font-weight:600; font-size:13px; color:var(--txt); white-space:nowrap; }
+  #ver { font-weight:600; font-size:13px; color:var(--txt); white-space:nowrap;
+         cursor:pointer; user-select:text; }
+  #ver:hover { color:var(--active); }
   #copyr { color:var(--dim); font-size:12px; white-space:nowrap; }
   header .bar .brand { display:flex; flex-direction:column; align-items:flex-start;
                        line-height:1.3; white-space:nowrap; }
@@ -525,7 +532,7 @@ PAGE = r"""<!doctype html>
 <header>
   <div class="bar">
     <div class="brand">
-      <span id="ver">Subtap</span>
+      <span id="ver" title="click to copy version + code + audio diagnostics">Subtap</span>
       <span id="copyr"></span>
     </div>
     <span class="grow"></span>
@@ -613,7 +620,7 @@ const $ = s => document.querySelector(s);
 // and MODE.* are used as keys into TAP_HELP -- so the values must stay exactly these.
 const MODE = { STARTS:"starts", STARTSTOP:"startstop" };
 const DRAG = { START:"start", END:"end", SCRUB:"scrub" };
-const API  = { DATA:"/api/data", SAVE:"/api/save", SAVETXT:"/api/savetxt" };   // must match the Python routes below
+const API  = { DATA:"/api/data", SAVE:"/api/save", SAVETXT:"/api/savetxt", PING:"/api/ping" };   // must match the Python routes below
 
 // Canvas colors in ONE place: the solids mirror the CSS custom properties (single source of
 // truth for the theme), the alpha/canvas-only shades are noted inline.
@@ -691,9 +698,29 @@ function applyCues(arr, opts){
 }
 
 let codeHash="";
+// Heartbeat: tell the server our window is alive every few seconds. A newly-launched
+// Subtap uses this to tell live instances (keep) from orphaned servers (reap). Fire one
+// immediately so a just-opened window is marked live right away.
+const ping = ()=>fetch(API.PING).catch(()=>{});
+ping(); setInterval(ping, 5000);
+let verText="Subtap", diag="audio: not loaded";   // click the version string to copy these
+// Click the version string to copy version + page-code hash + audio decode result. Gives an
+// easy, exact bug report ("what version am I on / why won't audio load") with no DevTools.
+async function copyDiag(){
+  const txt = verText + " · code " + (codeHash||"?") + " · " + diag
+            + " · UA " + navigator.userAgent;
+  try { await navigator.clipboard.writeText(txt); }
+  catch(_) {                                   // clipboard API blocked -> execCommand fallback
+    const ta=document.createElement("textarea"); ta.value=txt; document.body.appendChild(ta);
+    ta.select(); try{ document.execCommand("copy"); }catch(__){} ta.remove();
+  }
+  flash("copied: " + txt);
+}
+window.addEventListener("DOMContentLoaded", ()=>{ const v=$("#ver"); if(v) v.addEventListener("click", copyDiag); });
 async function load(){
   const d = await (await fetch(API.DATA)).json();
-  $("#ver").textContent = "Subtap " + (d.version || "");
+  verText = "Subtap " + (d.version || "");
+  $("#ver").textContent = verText;
   $("#copyr").textContent = d.copyright || "";
   codeHash = d.code || "";
   player.onended = ()=>{ if(tap) exitTap(); };   // leave tap mode when the audio finishes
@@ -708,11 +735,16 @@ async function load(){
       const bytes = await (await fetch(d.audio_url)).arrayBuffer();
       // real decode -> real waveform. Race a timeout so headless Chrome (which won't decode audio)
       // falls back to a synthetic waveform instead of hanging forever.
-      const ab = await Promise.race([ audioCtx.decodeAudioData(bytes),
-        new Promise((_,rej)=>setTimeout(()=>rej(new Error("decode timeout")), 4000)) ]);
+      const ab = await decodeWithTimeout(bytes);
       dur=ab.duration; durStr=fmt(dur); durSec=dur.toFixed(2);
       player.init(audioCtx, ab); computePeaks(ab); drawWave();
-    } catch(e){ console.warn("audio decode failed/timeout", e); if(DEMO) demoWaveform(); }
+      diag="audio: "+dur.toFixed(1)+"s "+ab.numberOfChannels+"ch "+ab.sampleRate+"Hz ok ("+(bytes.byteLength)+" bytes)";
+    } catch(e){
+      diag="audio DECODE FAILED: "+(e&&e.name)+" — "+(e&&e.message);
+      console.warn("audio decode failed/timeout", e);
+      flash("couldn't decode audio — click the version (top-left) to copy the error");
+      if(DEMO) demoWaveform();
+    }
     if(DEMO) applyDemoPose();   // fake edits + tap-sync pose on top of the real (or synthetic) waveform
   } else {
     applyCues([]);   // bare: open your own audio + caption files from the top-bar buttons
@@ -1354,9 +1386,22 @@ function _download(name, text){
 }
 
 // ---- audio: decode any file the browser supports, feed the player + waveform ----
+// Race decodeAudioData against a timeout: headless Chrome never resolves it, and a wedged
+// WebView2 media process can hang forever too -- without this the UI would just freeze with
+// no error. On timeout/failure the caller records it in `diag` (copyable via the version string).
+function decodeWithTimeout(arrbuf, ms=8000){
+  audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+  return Promise.race([
+    audioCtx.decodeAudioData(arrbuf),
+    new Promise((_,rej)=>setTimeout(()=>rej(new Error("decode timed out after "+ms+"ms (audio subsystem may be wedged)")), ms)),
+  ]);
+}
 async function loadAudioBuffer(arrbuf, name){
   audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
-  const ab = await audioCtx.decodeAudioData(arrbuf);
+  let ab;
+  try { ab = await decodeWithTimeout(arrbuf); }
+  catch(e){ diag="audio DECODE FAILED: "+(e&&e.name)+" — "+(e&&e.message); throw e; }
+  diag="audio: "+ab.duration.toFixed(1)+"s "+ab.numberOfChannels+"ch "+ab.sampleRate+"Hz ok ("+arrbuf.byteLength+" bytes)";
   player.pause(); player.init(audioCtx, ab); player.syncSet=false; player.offset=0;
   dur=ab.duration; durStr=fmt(dur); durSec=dur.toFixed(2);
   // if the captions are still the un-placed 2s default (txt loaded before audio) and untouched,
@@ -1528,6 +1573,8 @@ sizeCanvas(); restorePrefs(); load();
 ROUTE_DATA = "/api/data"
 ROUTE_SAVE = "/api/save"
 ROUTE_SAVETXT = "/api/savetxt"
+ROUTE_PING = "/api/ping"        # page heartbeat -> keeps this instance marked "has a live window"
+ROUTE_STATUS = "/api/status"    # liveness probe for a new launch's orphan reaper
 MEDIA_PREFIX = "/media/audio"
 AUDIO_URL = "/media/audio.mp3"
 
@@ -1558,6 +1605,71 @@ class Editor:
     save_target: Path = None  # where Save writes in the desktop app (the picked/resumed .srt)
     title: str = ""
     version: str = ""
+    # Liveness heartbeat: the open page pings /api/ping every few seconds, so `last_ping`
+    # tells a newly-launched instance whether an existing server on some port still has a
+    # live window (recent ping) or is an orphan to reap (page long gone). See _reap_orphans.
+    last_ping: float = 0.0
+
+
+class SubtapServer(ThreadingHTTPServer):
+    # Windows footgun: the default SO_REUSEADDR lets a SECOND process bind a port the first
+    # is already listening on, and the OS then routes requests to either one -- so two Subtaps
+    # silently share 8756 and you get stale pages from the old one. SO_EXCLUSIVEADDRUSE makes
+    # the second bind FAIL instead, so the port-bump loop in main() lands on a truly free port
+    # and every window always talks to its own server. (No-op / harmless on non-Windows.)
+    allow_reuse_address = False
+
+    def server_bind(self):
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive is not None:
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
+
+def _reap_orphans(base_port, span=20, idle_after=20.0):
+    """Kill leftover Subtap servers whose window is gone before we start a new one.
+
+    Scans the small port range Subtap uses. For each port that answers as a Subtap
+    /api/status, we only kill it if its page hasn't pinged in `idle_after` seconds --
+    i.e. its window is closed but the process leaked (a crash, or a `--no-browser` run
+    with no tab open). Instances with a live window keep pinging and are left alone, so
+    this is safe in multi-instance use.
+
+    Ports are probed in PARALLEL with a short timeout: on Windows a connect to an unused
+    loopback port can black-hole for the whole timeout rather than refuse instantly, so a
+    serial scan of the range would stall startup for many seconds."""
+    def _probe(p):
+        for _ in range(2):   # a server that's up but still warming may drop its first connection
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{p}/api/status", timeout=0.5) as r:
+                    body = r.read().decode("utf-8")
+                if body:
+                    return json.loads(body)
+            except Exception:
+                return None   # nothing (or not HTTP) here -> don't waste the second try
+        return None
+
+    def _check(p):
+        info = _probe(p)
+        if not info or info.get("app") != "subtap":
+            return None
+        pid, idle = info.get("pid"), info.get("idle", 0)
+        if pid and pid != os.getpid() and idle > idle_after:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                return (p, pid, idle)
+            except OSError:
+                pass
+        return None
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=span) as ex:
+        for hit in ex.map(_check, range(base_port, base_port + span)):
+            if hit:
+                print(f"reaped orphaned Subtap (pid {hit[1]}, idle {hit[2]:.0f}s) on port {hit[0]}")
 
 
 def make_handler():
@@ -1618,6 +1730,14 @@ def make_handler():
                 self._send(200, FAVICON, "image/svg+xml")
             elif path.startswith(MEDIA_PREFIX):
                 self._serve_media()
+            elif path == ROUTE_PING:
+                Editor.last_ping = time.time()
+                self._send(200, json.dumps({"ok": True}))
+            elif path == ROUTE_STATUS:
+                self._send(200, json.dumps({
+                    "app": "subtap", "pid": os.getpid(), "version": Editor.version,
+                    "idle": round(time.time() - Editor.last_ping, 1),
+                }))
             elif path == ROUTE_DATA:
                 if Editor.srt is None:      # no song pre-loaded -> empty; user opens files in the UI
                     self._send(200, json.dumps({
@@ -1725,13 +1845,22 @@ def main():
     Editor.version = _version_string()
     print(f"Subtap {Editor.version}  {__copyright__}")
 
+    # Seed the heartbeat so this fresh instance looks "live" to any other instance's reaper
+    # until our own page starts pinging (its default 0.0 would read as infinitely idle).
+    Editor.last_ping = time.time()
+
+    # Clear out leftover Subtap servers whose window is gone, so they don't linger holding a
+    # port (and so 8756 is usually free for us). Live instances keep pinging and are spared.
+    _reap_orphans(args.port)
+    time.sleep(0.3)   # give a reaped process a moment to release its socket
+
     port = args.port
     for _ in range(20):
         try:
-            httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler())
+            httpd = SubtapServer(("127.0.0.1", port), make_handler())
             break
         except OSError:
-            port += 1
+            port += 1   # taken by a live Subtap (or anything else) -> next port, no shadowing
     else:
         sys.exit("error: could not find a free port")
 
